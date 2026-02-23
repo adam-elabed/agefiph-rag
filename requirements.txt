@@ -1,0 +1,5 @@
+streamlit
+semantic-kernel
+python-dotenv
+azure-core
+azure-search-documents
