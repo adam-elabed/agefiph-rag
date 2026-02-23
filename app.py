@@ -419,7 +419,7 @@ JSON:
 # Streamlit UI (manager-friendly)
 # ==============================
 st.set_page_config(page_title="Agefiph RAG POC", layout="centered")
-st.title("Agefiph RAG POC")
+st.title("Agefiph Chatbot POC")
 
 col1, col2 = st.columns([1, 1])
 with col1:
