@@ -1,4 +1,4 @@
-# app.py (Streamlit Cloud-ready)
+# app.py (Streamlit Cloud-ready) — full code
 import os
 import re
 import base64
@@ -84,6 +84,37 @@ def run_async(coro):
         finally:
             new_loop.close()
     return asyncio.run(coro)
+
+
+# ==============================
+# Robust JSON extraction (handles ```json fences)
+# ==============================
+def extract_json(raw: str) -> Optional[dict]:
+    if not raw:
+        return None
+
+    s = raw.strip()
+
+    # Remove code fences if present
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+
+    # Try direct parse
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Fallback: find first JSON object
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+    return None
 
 
 # ==============================
@@ -174,6 +205,26 @@ Message:
             return intent
     return "specific"
 
+def override_intent_heuristics(q: str, intent: str) -> str:
+    q_low = (q or "").lower()
+
+    overview_triggers = [
+        "quelles aides", "quelles sont les aides", "liste des aides", "toutes les aides",
+        "aides proposées", "aides agefiph", "quels dispositifs", "dispositifs", "panorama",
+        "qu'est ce que vous proposez", "que propose agefiph", "quels types d'aides"
+    ]
+    if any(t in q_low for t in overview_triggers):
+        return "overview"
+
+    definition_triggers = [
+        "c'est quoi agefiph", "c quoi agefiph", "qu'est-ce que l'agefiph",
+        "rôle de l'agefiph", "mission de l'agefiph", "definition agefiph"
+    ]
+    if any(t in q_low for t in definition_triggers):
+        return "definition"
+
+    return intent
+
 async def generate_smalltalk(message: str, history_text: str) -> str:
     kernel, _ = build_kernel_and_embedder()
     prompt = f"""
@@ -202,11 +253,11 @@ async def retrieve_contexts(query: str, k: int, gate_threshold: float) -> List[D
     qvec = (await embedder.generate_embeddings([query]))[0]
     vq = VectorizedQuery(vector=qvec, k=k, fields="text_vector")
 
-    # IMPORTANT: async credential for async SearchClient
     search_client = SearchClient(
         endpoint=must("AZURE_AI_SEARCH_ENDPOINT"),
         index_name=must("AZURE_AI_SEARCH_INDEX"),
-        credential=AzureKeyCredential(must("AZURE_AI_SEARCH_API_KEY")),    )
+        credential=AzureKeyCredential(must("AZURE_AI_SEARCH_API_KEY")),
+    )
 
     try:
         results = await search_client.search(
@@ -325,6 +376,7 @@ Reply:
         [f"[title={c['title']} page={c.get('page')} chunk_id={c['chunk_id']}]\n{c['text']}" for c in contexts]
     )
 
+    # Definition: never ask clarification
     if intent == "definition":
         prompt = f"""
 You are an Agefiph assistant.
@@ -346,6 +398,7 @@ Answer:
 """.strip()
         return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
 
+    # Overview/specific use strict JSON schema internally
     if intent == "overview":
         instruction = """
 Task (overview):
@@ -394,15 +447,15 @@ JSON:
 
     raw = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
 
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return raw.strip()
+    data = extract_json(raw)
+    if data is None:
+        # Fallback: do not expose raw JSON to end users
+        return "Je n’ai pas pu formater correctement la réponse. Pouvez-vous reformuler votre question ?"
 
     if data.get("needs_clarification"):
         qs = data.get("clarifying_questions") or []
         if qs:
-            return qs[0].strip()
+            return str(qs[0]).strip()
         return await generate_clarifying_question(question, history_text)
 
     answer = (data.get("answer") or "").strip()
@@ -450,10 +503,12 @@ if q:
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             history_text = history_to_text(st.session_state.messages, max_turns=10)
+
             intent = run_async(classify_intent(q))
+            intent = override_intent_heuristics(q, intent)
 
             if intent == "smalltalk":
-                contexts = []
+                contexts: List[Dict[str, Any]] = []
                 answer = run_async(generate_smalltalk(q, history_text))
             else:
                 k1, g1 = retrieval_params_for_intent(intent, base_top_k=DEFAULT_TOP_K, base_gate=DEFAULT_GATE)
