@@ -1,14 +1,43 @@
-# app.py (Streamlit Cloud-ready) — full code
+# app.py — Streamlit Cloud-ready (Generic “Answer-first” RAG, no numbered choices, no sources)
+#
+# Goals (generic, not case-by-case):
+# ✅ Answer-first: respond with whatever is possible from context, THEN ask 1 follow-up.
+# ✅ Ask clarification ONLY when strictly necessary (otherwise it feels bureaucratic).
+# ✅ No numbered choices ("1=..., 2=...") anywhere.
+# ✅ Multi-query retrieval (3 queries) to improve recall and reduce “wrong audience” chunks.
+# ✅ No sources displayed.
+# ✅ Health mentions (pain/symptoms): 1 short safe sentence, no medical advice.
+# ✅ Concise + precise: 4–8 sentences, grounded only in indexed docs (no invented amounts/conditions).
+#
+# Required secrets/env:
+#   AZURE_OPENAI_ENDPOINT
+#   AZURE_OPENAI_API_KEY
+#   AZURE_OPENAI_API_VERSION
+#   AZURE_OPENAI_CHAT_DEPLOYMENT
+#   AZURE_OPENAI_EMBED_DEPLOYMENT
+#   AZURE_OPENAI_EMBED_API_VERSION
+#   AZURE_AI_SEARCH_ENDPOINT
+#   AZURE_AI_SEARCH_INDEX
+#   AZURE_AI_SEARCH_API_KEY
+#
+# Optional (semantic ranker):
+#   AZURE_AI_SEARCH_SEMANTIC_CONFIG = semantic-config-agefiph (or your config name)
+#
+# Optional tuning:
+#   APP_TOP_K=18
+#   APP_MAX_CTX=8
+#   APP_DEBUG_CONTROLLER=true
+#   APP_DEBUG_RETRIEVAL=true
+
 import os
 import re
-import base64
 import json
+import base64
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
-# Load .env only for local runs (Streamlit Cloud uses st.secrets)
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
@@ -24,21 +53,23 @@ from azure.search.documents.models import VectorizedQuery
 
 
 # ==============================
-# Settings: st.secrets first, then env
+# Settings helpers
 # ==============================
 def get_setting(name: str, default: Optional[str] = None) -> Optional[str]:
-    # Streamlit secrets (Cloud or local .streamlit/secrets.toml)
     try:
-        return str(st.secrets[name]) if name in st.secrets else os.getenv(name, default)
+        if name in st.secrets:
+            return str(st.secrets[name])
     except Exception:
-        # If secrets are not configured locally, fall back to env vars
-        return os.getenv(name, default)
+        pass
+    return os.getenv(name, default)
+
 
 def must(name: str) -> str:
     v = get_setting(name)
     if not v:
-        raise RuntimeError(f"Missing setting: {name} (add it to Streamlit Secrets or env vars)")
+        raise RuntimeError(f"Missing setting: {name} (Streamlit Secrets or env vars)")
     return v
+
 
 def env_int(name: str, default: int) -> int:
     v = get_setting(name, str(default))
@@ -47,31 +78,27 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def env_float(name: str, default: float) -> float:
     v = get_setting(name, str(default))
     try:
-        return float(v)  # type: ignore[arg-type]
+        return float(v)
     except Exception:
         return default
 
 
-# Default hidden params (override via env/secrets)
-DEFAULT_TOP_K = env_int("APP_TOP_K", 10)
-DEFAULT_GATE = env_float("APP_GATE", 0.30)
+DEFAULT_TOP_K = env_int("APP_TOP_K", 18)
+DEFAULT_MAX_CONTEXTS = env_int("APP_MAX_CTX", 8)
+DEFAULT_GATE = env_float("APP_GATE", 0.0)
 
-# Optional debug (off by default for managers)
-DEBUG_INTENT = (get_setting("APP_DEBUG_INTENT", "false") or "false").lower() == "true"
+DEBUG_CONTROLLER = (get_setting("APP_DEBUG_CONTROLLER", "false") or "false").lower() == "true"
 DEBUG_RETRIEVAL = (get_setting("APP_DEBUG_RETRIEVAL", "false") or "false").lower() == "true"
 
 
 # ==============================
-# Async runner (robust in Streamlit)
+# Async runner
 # ==============================
 def run_async(coro):
-    """
-    Streamlit can run in an environment where an event loop already exists.
-    This helper runs async code robustly.
-    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -87,58 +114,11 @@ def run_async(coro):
 
 
 # ==============================
-# Robust JSON extraction (handles ```json fences)
+# Text utils
 # ==============================
-def extract_json(raw: str) -> Optional[dict]:
-    if not raw:
-        return None
-
-    s = raw.strip()
-
-    # Remove code fences if present
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-
-    # Try direct parse
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    # Fallback: find first JSON object
-    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-
-    return None
-
-
-# ==============================
-# Utils
-# ==============================
-def decode_parent_id(parent_id: str) -> str:
-    if not parent_id:
-        return ""
-    try:
-        s = parent_id.strip()
-        s += "=" * (-len(s) % 4)
-        url = base64.urlsafe_b64decode(s.encode("utf-8")).decode("utf-8")
-        url = re.sub(r"\.pdf\d+\b", ".pdf", url)
-        url = re.sub(r"\.pdf\d+_", ".pdf_", url)
-        return url
-    except Exception:
-        return parent_id
-
-def extract_page_from_title(title: str) -> Optional[int]:
-    m = re.search(r"input-(\d+)\.pdf", title or "")
-    return int(m.group(1)) if m else None
-
-def clean_chunk(t: str) -> str:
+def clean_ws(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "").strip())
+
 
 def history_to_text(messages: List[Dict[str, Any]], max_turns: int = 10) -> str:
     tail = messages[-max_turns * 2:] if len(messages) > max_turns * 2 else messages
@@ -148,8 +128,69 @@ def history_to_text(messages: List[Dict[str, Any]], max_turns: int = 10) -> str:
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        out.append(f"{'User' if role=='user' else 'Assistant'}: {content}")
+        out.append(f"{'Utilisateur' if role=='user' else 'Assistant'}: {content}")
     return "\n".join(out)
+
+
+def safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def decode_parent_id(parent_id: str) -> str:
+    # Not shown to user; kept only for optional debug.
+    if not parent_id:
+        return ""
+    try:
+        s = parent_id.strip()
+        s += "=" * (-len(s) % 4)
+        url = base64.urlsafe_b64decode(s.encode("utf-8")).decode("utf-8")
+        url = re.sub(r"\.pdf\d+\b", ".pdf", url)
+        url = re.sub(r"\.pdf\d+_", ".pdf_", url)
+        url = re.sub(r"\.html\d+\b", ".html", url)
+        url = re.sub(r"\.html\d+_", ".html_", url)
+        return url
+    except Exception:
+        return parent_id
+
+
+def extract_page_from_title(title: str) -> Optional[int]:
+    m = re.search(r"input-(\d+)\.pdf", title or "")
+    return int(m.group(1)) if m else None
+
+
+def normalize_intent(x: str) -> str:
+    x = (x or "").strip().lower()
+    return x if x in {"smalltalk", "definition", "overview", "specific", "out_of_scope"} else "specific"
+
+
+def normalize_audience(x: str) -> str:
+    x = (x or "").strip().lower()
+    return x if x in {"personne", "employeur", "formation", "conseiller", "unknown"} else "unknown"
+
+
+def is_short_yes(text: str) -> bool:
+    t = clean_ws(text).lower()
+    return t in {
+        "oui", "yes", "ok", "okay", "d'accord", "dac", "merci",
+        "c'est bon", "parfait", "super", "top", "nickel",
+        "ça répond", "ca repond", "c'est clair", "cest clair"
+    }
 
 
 # ==============================
@@ -180,75 +221,244 @@ def build_kernel_and_embedder():
 
 
 # ==============================
-# Intent router
+# Generic “Answer-first” Controller + Resolver (NO numbers)
 # ==============================
-INTENTS = ("smalltalk", "definition", "overview", "specific")
+STATUS_QUESTION = (
+    "Pour vous orienter au mieux, vous êtes plutôt une personne en situation de handicap, "
+    "un employeur, un organisme de formation, ou un conseiller ?"
+)
 
-async def classify_intent(message: str) -> str:
-    kernel, _ = build_kernel_and_embedder()
-    prompt = f"""
-Return ONLY one token:
-smalltalk | definition | overview | specific
+CONTROLLER_PROMPT = """
+Vous êtes le contrôleur d’un chatbot Agefiph.
 
-- smalltalk: greetings, thanks, casual chat, "help", "what can you do"
-- definition: "what is Agefiph", "c'est quoi Agefiph", "rôle de l'Agefiph"
-- overview: asks for a list/summary of all aids/services
-- specific: asks about a specific aid, amount, eligibility, steps, conditions
+Objectif :
+Décider quoi faire AVANT de répondre (intention, audience, besoin de clarification, requête de recherche).
 
-Message:
+Principe générique “Answer-first” :
+- Si une première réponse utile est possible sans information supplémentaire, needs_clarification=false.
+- needs_clarification=true uniquement si une clarification est indispensable pour éviter une réponse vide, trompeuse ou inutile.
+- Ne posez pas une question “de tri” si vous pouvez déjà répondre partiellement.
+
+Contraintes :
+- Périmètre : handicap + emploi + formation + aides/services Agefiph (et partenaires cités).
+- Hors périmètre => intent=out_of_scope.
+- Une seule question de clarification max.
+- IMPORTANT : ne jamais proposer de choix numérotés.
+
+Intent :
+- “c’est quoi Agefiph ?” => definition
+- “toutes les aides / panorama / toutes les infos” => overview
+- salutations => smalltalk
+- sinon => specific
+
+Audience (si détectable) :
+- personne : PSH/RQTH/demandeur d’emploi handicap/salarié handicap
+- employeur : entreprise/RH/recrutement/maintien
+- formation : organisme/financement/accessibilité formation
+- conseiller : prescripteur/accompagnant
+- unknown : sinon
+
+Retour JSON strict :
+{{
+  "intent": "smalltalk|definition|overview|specific|out_of_scope",
+  "audience": "personne|employeur|formation|conseiller|unknown",
+  "needs_clarification": true|false,
+  "clarifying_question": "string",
+  "retrieval_query": "string"
+}}
+
+Règles :
+- retrieval_query : reformulez la demande pour la recherche documentaire (corrigez les fautes).
+- Si needs_clarification=false => clarifying_question="".
+- Si needs_clarification=true => clarifying_question = question courte, naturelle, sans numéros.
+
+Historique récent :
+{history}
+
+Message utilisateur :
 {message}
 """.strip()
 
-    out = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip().lower()
-    for intent in INTENTS:
-        if intent in out:
-            return intent
-    return "specific"
 
-def override_intent_heuristics(q: str, intent: str) -> str:
-    q_low = (q or "").lower()
-
-    overview_triggers = [
-        "quelles aides", "quelles sont les aides", "liste des aides", "toutes les aides",
-        "aides proposées", "aides agefiph", "quels dispositifs", "dispositifs", "panorama",
-        "qu'est ce que vous proposez", "que propose agefiph", "quels types d'aides"
-    ]
-    if any(t in q_low for t in overview_triggers):
-        return "overview"
-
-    definition_triggers = [
-        "c'est quoi agefiph", "c quoi agefiph", "qu'est-ce que l'agefiph",
-        "rôle de l'agefiph", "mission de l'agefiph", "definition agefiph"
-    ]
-    if any(t in q_low for t in definition_triggers):
-        return "definition"
-
-    return intent
-
-async def generate_smalltalk(message: str, history_text: str) -> str:
+async def controller_decide(message: str, history_text: str) -> Dict[str, Any]:
     kernel, _ = build_kernel_and_embedder()
-    prompt = f"""
-You are a helpful assistant specialized in Agefiph.
+    prompt = CONTROLLER_PROMPT.format(history=history_text, message=message)
+    raw = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
 
-Reply politely and briefly.
-If it is a greeting/help request, introduce that you can answer questions about Agefiph aids/services and ask what the user needs.
-Do NOT mention internal tools.
+    data = safe_json_loads(raw)
+    if not data:
+        # Be permissive: answer-first even if parsing fails
+        return {
+            "intent": "specific",
+            "audience": "unknown",
+            "needs_clarification": False,
+            "clarifying_question": "",
+            "retrieval_query": message,
+            "raw": raw,
+        }
 
-Conversation:
-{history_text}
+    intent = normalize_intent(str(data.get("intent", "specific")))
+    audience = normalize_audience(str(data.get("audience", "unknown")))
+    needs = bool(data.get("needs_clarification", False))
+    cq = str(data.get("clarifying_question", "") or "").strip()
+    rq = str(data.get("retrieval_query", "") or "").strip()
 
-User message:
-{message}
+    # Hard rule: no numbered choices
+    if re.search(r"\b\d+\s*=", cq) or re.search(r"\b(1|2|3|4)\b\s*[:=-]", cq):
+        cq = STATUS_QUESTION
 
-Assistant reply:
+    if needs and not cq:
+        cq = STATUS_QUESTION
+    if (not needs) and cq:
+        cq = ""
+    if not rq:
+        rq = message
+
+    return {
+        "intent": intent,
+        "audience": audience,
+        "needs_clarification": needs,
+        "clarifying_question": cq,
+        "retrieval_query": rq,
+        "raw": raw,
+    }
+
+
+RESOLVER_PROMPT = """
+Vous résolvez une clarification déjà posée.
+
+Objectif :
+- Interpréter la réponse libre de l’utilisateur par rapport à la question.
+- Si la réponse permet de décider => resolved=true et produire intent/audience/retrieval_query.
+- Si la réponse demande un panorama (“tout”, “toutes les aides”, “panorama”, “toutes les infos”) => resolved=true, intent=overview.
+- Si la réponse est insuffisante (“oui”, “ok”, “d'accord”...) => resolved=false et poser UNE question courte, sans numéros.
+
+Contraintes :
+- IMPORTANT : ne jamais proposer de choix numérotés.
+
+Retour JSON strict :
+{{
+  "resolved": true|false,
+  "intent": "definition|overview|specific|out_of_scope",
+  "audience": "personne|employeur|formation|conseiller|unknown",
+  "retrieval_query": "string",
+  "next_question": "string"
+}}
+
+Question précédente :
+{clarifying_question}
+
+Réponse utilisateur :
+{user_answer}
 """.strip()
-    return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
+
+
+async def resolve_clarification(clarifying_question: str, user_answer: str) -> Dict[str, Any]:
+    kernel, _ = build_kernel_and_embedder()
+    prompt = RESOLVER_PROMPT.format(
+        clarifying_question=clarifying_question,
+        user_answer=user_answer,
+    )
+    raw = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
+
+    data = safe_json_loads(raw) or {}
+    resolved = bool(data.get("resolved", False))
+    intent = normalize_intent(str(data.get("intent", "specific")))
+    audience = normalize_audience(str(data.get("audience", "unknown")))
+    rq = str(data.get("retrieval_query", "") or "").strip()
+    nq = str(data.get("next_question", "") or "").strip()
+
+    fallback_q = "Pouvez-vous préciser en une phrase ce que vous cherchez exactement (emploi, formation, maintien, adaptation du poste, ou autre) ?"
+
+    if resolved and not rq:
+        resolved = False
+        nq = fallback_q
+
+    if (not resolved) and not nq:
+        nq = fallback_q
+
+    if re.search(r"\b\d+\b", nq) and ("choisissez" in nq.lower() or "répondez" in nq.lower()):
+        nq = fallback_q
+
+    return {
+        "resolved": resolved,
+        "intent": intent,
+        "audience": audience,
+        "retrieval_query": rq,
+        "next_question": nq,
+        "raw": raw,
+    }
 
 
 # ==============================
-# Retrieval (Azure AI Search hybrid)
+# Multi-query expansion (LLM) + caching
 # ==============================
-async def retrieve_contexts(query: str, k: int, gate_threshold: float) -> List[Dict[str, Any]]:
+MULTI_QUERY_PROMPT = """
+Vous générez des requêtes de recherche pour retrouver des passages dans des documents Agefiph.
+
+Objectif :
+Donner 3 requêtes courtes et différentes couvrant la même intention, en français.
+- Corrigez les fautes.
+- Ajoutez des synonymes utiles.
+- Gardez les requêtes concises.
+- Pas de numéros.
+
+Retour JSON strict :
+{{
+  "queries": ["...", "...", "..."]
+}}
+
+Entrée :
+- audience: {audience}
+- intent: {intent}
+- question utilisateur: {question}
+- requête de base: {base_query}
+""".strip()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_multi_queries(audience: str, intent: str, question: str, base_query: str) -> List[str]:
+    return run_async(expand_queries(audience, intent, question, base_query))
+
+
+async def expand_queries(audience: str, intent: str, question: str, base_query: str) -> List[str]:
+    kernel, _ = build_kernel_and_embedder()
+
+    if intent in {"smalltalk", "out_of_scope"}:
+        return [clean_ws(base_query) or clean_ws(question)]
+
+    prompt = MULTI_QUERY_PROMPT.format(
+        audience=audience,
+        intent=intent,
+        question=question,
+        base_query=base_query,
+    )
+    raw = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
+    data = safe_json_loads(raw) or {}
+    queries = data.get("queries", [])
+
+    out: List[str] = []
+    if isinstance(queries, list):
+        for q in queries:
+            qs = clean_ws(str(q))
+            if qs:
+                out.append(qs)
+
+    # Always include base query first
+    base = clean_ws(base_query) or clean_ws(question)
+    merged = [base] + [q for q in out if q.lower() != base.lower()]
+    merged = merged[:3] if len(merged) >= 3 else merged
+    return merged if merged else [base]
+
+
+# ==============================
+# Retrieval (Hybrid + optional Semantic Ranker)
+# ==============================
+def get_semantic_config_name() -> str:
+    return (get_setting("AZURE_AI_SEARCH_SEMANTIC_CONFIG", "") or "").strip()
+
+
+async def retrieve_once(query: str, k: int) -> List[Dict[str, Any]]:
     _, embedder = build_kernel_and_embedder()
     qvec = (await embedder.generate_embeddings([query]))[0]
     vq = VectorizedQuery(vector=qvec, k=k, fields="text_vector")
@@ -259,293 +469,373 @@ async def retrieve_contexts(query: str, k: int, gate_threshold: float) -> List[D
         credential=AzureKeyCredential(must("AZURE_AI_SEARCH_API_KEY")),
     )
 
+    semantic_cfg = get_semantic_config_name()
+    use_semantic = bool(semantic_cfg)
+
     try:
-        results = await search_client.search(
+        search_kwargs: Dict[str, Any] = dict(
             search_text=query,
             vector_queries=[vq],
             select=["chunk", "title", "parent_id", "chunk_id"],
             top=k,
         )
 
+        if use_semantic:
+            search_kwargs.update(
+                {
+                    "query_type": "semantic",
+                    "semantic_configuration_name": semantic_cfg,
+                    "query_caption": "extractive",
+                    "query_answer": "extractive",
+                }
+            )
+
+        results = await search_client.search(**search_kwargs)
+
         rows: List[Dict[str, Any]] = []
         async for r in results:
-            chunk = clean_chunk(r.get("chunk"))
+            chunk = clean_ws(r.get("chunk"))
             if not chunk:
-                continue
-            if "SOMMAIRE" in chunk:
                 continue
 
             title = r.get("title") or ""
             parent_id = r.get("parent_id") or ""
             chunk_id = r.get("chunk_id") or ""
-            score = float(r.get("@search.score", 0.0))
 
-            rows.append({
-                "text": chunk,
-                "title": title,
-                "page": extract_page_from_title(title),
-                "source_url": decode_parent_id(parent_id),  # kept internal
-                "chunk_id": chunk_id,
-                "score": score,
-            })
+            score = float(r.get("@search.rerankerScore", r.get("@search.score", 0.0)))
+
+            rows.append(
+                {
+                    "text": chunk,
+                    "title": title,
+                    "page": extract_page_from_title(title),
+                    "source_url": decode_parent_id(parent_id),
+                    "chunk_id": chunk_id,
+                    "score": score,
+                    "query": query,
+                }
+            )
 
         rows.sort(key=lambda x: x["score"], reverse=True)
-
-        # save debug rows (optional)
-        st.session_state["last_debug_rows"] = rows[:10]
-
-        if gate_threshold > 0 and (not rows or rows[0]["score"] < gate_threshold):
-            return []
-
-        # dedup + cap
-        seen = set()
-        out = []
-        for row in rows:
-            if row["text"] in seen:
-                continue
-            seen.add(row["text"])
-            out.append(row)
-            if len(out) >= 12:
-                break
-        return out
+        return rows
 
     finally:
         await search_client.close()
 
 
-def retrieval_params_for_intent(intent: str, base_top_k: int, base_gate: float) -> Tuple[int, float]:
+async def retrieve_contexts_multi(queries: List[str], k_total: int, gate_threshold: float) -> List[Dict[str, Any]]:
+    if not queries:
+        return []
+    per_q = max(6, k_total // max(1, len(queries)))
+
+    all_rows: List[Dict[str, Any]] = []
+    for q in queries:
+        all_rows.extend(await retrieve_once(q, k=per_q))
+
+    all_rows.sort(key=lambda x: x["score"], reverse=True)
+    st.session_state["last_debug_rows"] = all_rows[:10]
+
+    if gate_threshold > 0 and len(all_rows) < 2:
+        return []
+
+    # Dedup by chunk_id (preferred) or by text
+    best: Dict[str, Dict[str, Any]] = {}
+    for r in all_rows:
+        key = (r.get("chunk_id") or "").strip() or r["text"]
+        prev = best.get(key)
+        if (prev is None) or (r["score"] > float(prev.get("score", 0.0))):
+            best[key] = r
+
+    merged = list(best.values())
+    merged.sort(key=lambda x: x["score"], reverse=True)
+    return merged[:DEFAULT_MAX_CONTEXTS]
+
+
+def retrieval_params(intent: str) -> Tuple[int, float]:
     if intent == "overview":
-        return max(base_top_k, 30), 0.0
+        return max(DEFAULT_TOP_K, 24), 0.0
     if intent == "definition":
-        return max(base_top_k, 12), 0.0
-    return base_top_k, base_gate
+        return max(DEFAULT_TOP_K, 14), 0.0
+    return DEFAULT_TOP_K, DEFAULT_GATE
 
 
 # ==============================
-# Clarification (1 question max)
+# Answer generation (grounded + concise + generic follow-up)
 # ==============================
-async def need_clarification(intent: str, contexts: List[Dict[str, Any]]) -> bool:
-    if intent in ("overview", "definition"):
-        return False
-    if not contexts and intent == "specific":
-        return True
-    return False
+SYSTEM_RULES = """
+Vous êtes l’assistant virtuel de l’Agefiph.
 
-async def generate_clarifying_question(question: str, history_text: str) -> str:
+Règles (génériques) :
+- Répondez de façon naturelle, claire et concise (4 à 8 phrases maximum).
+- Utilisez UNIQUEMENT les informations présentes dans le CONTEXTE.
+- Ne jamais inventer : montants, numéros, délais, conditions, procédures, contacts.
+- Si le CONTEXTE ne suffit pas, posez UNE seule question courte pour préciser.
+- Si l’utilisateur mentionne une douleur ou un symptôme : ne donnez pas d’avis médical.
+  Ajoutez une seule phrase courte : "Je ne peux pas évaluer médicalement, mais je peux vous orienter sur les aides liées au travail/handicap."
+- Terminez par UNE question de suivi utile (pour affiner), sans demander de “choisir une catégorie”.
+""".strip()
+
+
+def audience_guard(audience: str) -> str:
+    # Generic guard to reduce leakage between audiences without per-case logic.
+    if audience == "personne":
+        return (
+            "Audience = personne. Ne mettez pas l'accent sur les aides exclusivement 'employeur'. "
+            "Si le contexte est surtout employeur, reformulez en termes utiles pour la personne (accompagnement, accès à l'emploi, maintien, adaptation)."
+        )
+    if audience == "employeur":
+        return "Audience = employeur. Concentrez-vous sur recrutement, intégration, maintien côté employeur."
+    if audience == "formation":
+        return "Audience = formation. Concentrez-vous sur aides/dispositifs liés à la formation et accessibilité."
+    if audience == "conseiller":
+        return "Audience = conseiller. Concentrez-vous sur orientation, prescription, articulation des dispositifs."
+    return "Audience inconnue : répondez de manière générale et posez une question de suivi qui précise la situation."
+
+
+async def generate_smalltalk() -> str:
+    return "Bonjour 👋 Dites-moi votre question sur l’Agefiph (emploi, formation, aides…), et je vous réponds."
+
+
+async def generate_rag_answer(question: str, intent: str, audience: str, contexts: List[Dict[str, Any]]) -> str:
     kernel, _ = build_kernel_and_embedder()
-    prompt = f"""
-Ask EXACTLY ONE concise clarifying question.
-Prefer the single most informative question.
-Do not mention documents or internal tools.
-Use the same language as the user.
 
-Conversation:
-{history_text}
+    if not contexts:
+        return (
+            "Je n’ai pas trouvé l’information nécessaire dans les documents actuellement indexés. "
+            "Pouvez-vous préciser votre besoin en une phrase (par exemple : trouver un emploi, garder votre emploi, adapter un poste, ou financer une formation) ?"
+        )
 
-User question:
+    context_text = "\n\n---\n\n".join(
+        [f"[title={c['title']} chunk_id={c['chunk_id']}]\n{c['text']}" for c in contexts]
+    )
+
+    guard = audience_guard(audience)
+
+    if intent == "definition":
+        prompt = f"""
+{SYSTEM_RULES}
+
+Garde-fou audience :
+{guard}
+
+Tâche :
+Donnez une définition courte, fidèle au contexte, puis posez UNE question de suivi utile.
+
+Question :
 {question}
 
-One clarifying question:
+CONTEXTE :
+{context_text}
+
+Réponse :
+""".strip()
+        return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
+
+    if intent == "overview":
+        prompt = f"""
+{SYSTEM_RULES}
+
+Garde-fou audience :
+{guard}
+
+Tâche :
+Faites un panorama court (6 à 10 puces maximum) uniquement à partir du contexte.
+Puis posez UNE question de suivi utile.
+
+Question :
+{question}
+
+CONTEXTE :
+{context_text}
+
+Réponse :
+""".strip()
+        return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
+
+    prompt = f"""
+{SYSTEM_RULES}
+
+Garde-fou audience :
+{guard}
+
+Règle :
+Si la réponse n’est pas clairement dans le contexte, posez UNE seule question courte pour préciser (et rien d’autre).
+
+Question :
+{question}
+
+CONTEXTE :
+{context_text}
+
+Réponse :
 """.strip()
     return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
 
 
 # ==============================
-# Answer generation (no sources shown)
+# Streamlit UI
 # ==============================
-async def generate_rag_answer(question: str, intent: str, contexts: List[Dict[str, Any]], history_text: str) -> str:
-    kernel, _ = build_kernel_and_embedder()
-
-    if not contexts:
-        if intent == "specific":
-            return await generate_clarifying_question(question, history_text)
-
-        prompt = f"""
-You are an Agefiph assistant.
-Write a short helpful reply asking the user to be more specific (goal/situation),
-without mentioning internal tools.
-
-User question:
-{question}
-
-Reply:
-""".strip()
-        return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
-
-    context_text = "\n\n---\n\n".join(
-        [f"[title={c['title']} page={c.get('page')} chunk_id={c['chunk_id']}]\n{c['text']}" for c in contexts]
-    )
-
-    # Definition: never ask clarification
-    if intent == "definition":
-        prompt = f"""
-You are an Agefiph assistant.
-Answer ONLY using the context. No external knowledge.
-Do NOT ask clarifying questions for definition requests.
-
-Write a clear definition (3-6 lines) + up to 2 short bullets (missions / who it helps) if present.
-
-Conversation:
-{history_text}
-
-Question:
-{question}
-
-Context:
-{context_text}
-
-Answer:
-""".strip()
-        return str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
-
-    # Overview/specific use strict JSON schema internally
-    if intent == "overview":
-        instruction = """
-Task (overview):
-- Output 6 to 10 distinct aids/services MAX.
-- Each bullet: name + one short description (<= 1 sentence) if present in context.
-- End with ONE short question to narrow down the need.
-- If list might be incomplete, set "partial" to true.
-"""
-    else:
-        instruction = """
-Task (specific):
-- Answer using ONLY the context.
-- If key details are missing to answer correctly, set "needs_clarification" to true and ask ONE question in "clarifying_questions".
-- Do NOT add disclaimers about information the user did not ask for.
-"""
-
-    prompt = f"""
-You are an Agefiph RAG assistant.
-
-Hard rules:
-- Use ONLY the context. No external knowledge.
-- If you cannot answer from context OR you need user-specific details, do NOT guess.
-- For clarifications: ask ONLY ONE question.
-
-Return STRICT JSON only with this schema:
-{{
-  "needs_clarification": boolean,
-  "clarifying_questions": string[],
-  "answer": string,
-  "partial": boolean
-}}
-
-Conversation:
-{history_text}
-
-User question:
-{question}
-
-Context:
-{context_text}
-
-{instruction}
-
-JSON:
-""".strip()
-
-    raw = str(await kernel.invoke_prompt(prompt, service_id="chat")).strip()
-
-    data = extract_json(raw)
-    if data is None:
-        # Fallback: do not expose raw JSON to end users
-        return "Je n’ai pas pu formater correctement la réponse. Pouvez-vous reformuler votre question ?"
-
-    if data.get("needs_clarification"):
-        qs = data.get("clarifying_questions") or []
-        if qs:
-            return str(qs[0]).strip()
-        return await generate_clarifying_question(question, history_text)
-
-    answer = (data.get("answer") or "").strip()
-    if not answer:
-        return "Je ne sais pas d'après les documents."
-
-    if data.get("partial") is True and intent == "overview":
-        answer += "\n\n(Liste partielle selon les documents.)"
-
-    return answer
-
-
-# ==============================
-# Streamlit UI (manager-friendly)
-# ==============================
-st.set_page_config(page_title="Agefiph RAG POC", layout="centered")
+st.set_page_config(page_title="Agefiph Chatbot POC", layout="centered")
 st.title("Agefiph Chatbot POC")
+st.caption("Assistant basé sur des documents Agefiph indexés (POC).")
 
 col1, col2 = st.columns([1, 1])
-with col1:
-    st.caption("Assistant basé sur les documents Agefiph (POC).")
 with col2:
     if st.button("Nouvelle conversation"):
         st.session_state.pop("messages", None)
         st.session_state.pop("last_debug_rows", None)
+        st.session_state.pop("pending", None)
+        st.session_state.pop("pending_type", None)
         st.rerun()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_debug_rows" not in st.session_state:
     st.session_state.last_debug_rows = []
+if "pending" not in st.session_state:
+    st.session_state.pending = None  # {"question": "..."}
+if "pending_type" not in st.session_state:
+    st.session_state.pending_type = None  # "clarification" or "followup"
 
-# Render history
+# Render chat history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-q = st.chat_input("Pose une question sur l’Agefiph…")
+q = st.chat_input("Posez une question sur l’Agefiph…")
 
 if q:
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
 
+    # If user says yes/ok after a follow-up, close politely (no loops)
+    if st.session_state.pending_type == "followup" and is_short_yes(q):
+        answer = "Parfait. Si vous avez une autre question, dites-moi ce que vous cherchez et je vous aide."
+        st.session_state.pending = None
+        st.session_state.pending_type = None
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.stop()
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             history_text = history_to_text(st.session_state.messages, max_turns=10)
 
-            intent = run_async(classify_intent(q))
-            intent = override_intent_heuristics(q, intent)
+            intent = "specific"
+            audience = "unknown"
+            contexts: List[Dict[str, Any]] = []
 
-            if intent == "smalltalk":
-                contexts: List[Dict[str, Any]] = []
-                answer = run_async(generate_smalltalk(q, history_text))
-            else:
-                k1, g1 = retrieval_params_for_intent(intent, base_top_k=DEFAULT_TOP_K, base_gate=DEFAULT_GATE)
+            # CASE A: resolve a clarification
+            if st.session_state.pending is not None and st.session_state.pending_type == "clarification":
+                pending_q = st.session_state.pending.get("question", "")
+                res = run_async(resolve_clarification(pending_q, q))
 
-                retrieval_query = q
-                if intent == "definition":
-                    retrieval_query = q + " mission objectif rôle Agefiph"
+                if res["resolved"]:
+                    st.session_state.pending = None
+                    st.session_state.pending_type = None
+                    intent = res["intent"]
+                    audience = res["audience"]
+                    retrieval_query = res["retrieval_query"]
 
-                contexts = run_async(retrieve_contexts(retrieval_query, k=k1, gate_threshold=g1))
-                if not contexts:
-                    contexts = run_async(retrieve_contexts(retrieval_query, k=max(k1, 25), gate_threshold=0.0))
+                    if intent == "out_of_scope":
+                        answer = "Je peux répondre uniquement aux questions liées au handicap et à l’emploi (aides et services de l’Agefiph)."
+                    else:
+                        k, gate = retrieval_params(intent)
+                        queries = cached_multi_queries(audience, intent, q, retrieval_query)
+                        contexts = run_async(retrieve_contexts_multi(queries, k_total=k, gate_threshold=gate))
+                        if not contexts:
+                            contexts = run_async(retrieve_contexts_multi(queries, k_total=max(k, 24), gate_threshold=0.0))
 
-                ask = run_async(need_clarification(intent, contexts))
-                if ask:
-                    answer = run_async(generate_clarifying_question(q, history_text))
+                        answer = run_async(generate_rag_answer(q, intent, audience, contexts))
+                        st.session_state.pending_type = "followup"
+
                 else:
-                    answer = run_async(generate_rag_answer(q, intent, contexts, history_text))
+                    answer = res["next_question"]
+                    st.session_state.pending = {"question": answer}
+                    st.session_state.pending_type = "clarification"
+
+                if DEBUG_CONTROLLER:
+                    with st.expander("Debug resolver", expanded=False):
+                        st.write(
+                            {
+                                "pending_question": pending_q,
+                                "resolved": res["resolved"],
+                                "intent": res["intent"],
+                                "audience": res["audience"],
+                                "retrieval_query": res["retrieval_query"],
+                                "next_question": res["next_question"],
+                                "raw": res.get("raw", "")[:900],
+                            }
+                        )
+
+            # CASE B: normal controller flow
+            else:
+                decision = run_async(controller_decide(q, history_text))
+                intent = decision["intent"]
+                audience = decision["audience"]
+                needs_clarification = decision["needs_clarification"]
+                clarifying_question = decision["clarifying_question"]
+                retrieval_query = decision["retrieval_query"]
+
+                if intent == "out_of_scope":
+                    answer = "Je peux répondre uniquement aux questions liées au handicap et à l’emploi (aides et services de l’Agefiph)."
+                    st.session_state.pending = None
+                    st.session_state.pending_type = None
+
+                elif intent == "smalltalk":
+                    answer = run_async(generate_smalltalk())
+                    st.session_state.pending = None
+                    st.session_state.pending_type = None
+
+                elif needs_clarification:
+                    answer = (clarifying_question.strip() or STATUS_QUESTION)
+                    st.session_state.pending = {"question": answer}
+                    st.session_state.pending_type = "clarification"
+
+                else:
+                    k, gate = retrieval_params(intent)
+                    queries = cached_multi_queries(audience, intent, q, retrieval_query)
+                    contexts = run_async(retrieve_contexts_multi(queries, k_total=k, gate_threshold=gate))
+                    if not contexts:
+                        contexts = run_async(retrieve_contexts_multi(queries, k_total=max(k, 24), gate_threshold=0.0))
+
+                    answer = run_async(generate_rag_answer(q, intent, audience, contexts))
+                    st.session_state.pending = None
+                    st.session_state.pending_type = "followup"
+
+                if DEBUG_CONTROLLER:
+                    with st.expander("Debug controller", expanded=False):
+                        dbg_queries = []
+                        if intent not in {"smalltalk", "out_of_scope"}:
+                            dbg_queries = cached_multi_queries(audience, intent, q, retrieval_query)
+                        st.write(
+                            {
+                                "intent": intent,
+                                "audience": audience,
+                                "needs_clarification": needs_clarification,
+                                "clarifying_question": clarifying_question,
+                                "retrieval_query": retrieval_query,
+                                "multi_queries": dbg_queries,
+                                "raw": decision.get("raw", "")[:900],
+                            }
+                        )
+
+            if DEBUG_RETRIEVAL:
+                with st.expander("Debug retrieval (top rows)", expanded=False):
+                    rows = st.session_state.get("last_debug_rows", [])
+                    for s in rows:
+                        st.write(
+                            {
+                                "score": s.get("score"),
+                                "title": s.get("title"),
+                                "chunk_id": s.get("chunk_id"),
+                                "query": s.get("query"),
+                                "preview": (s.get("text") or "")[:240],
+                            }
+                        )
 
         st.markdown(answer)
 
-        # optional dev debug (hidden by default)
-        if DEBUG_INTENT:
-            st.caption(f"intent: `{intent}`")
-        if DEBUG_RETRIEVAL:
-            with st.expander("Debug retrieval (raw top rows)", expanded=False):
-                rows = st.session_state.get("last_debug_rows", [])
-                for s in rows:
-                    st.write({
-                        "score": s.get("score"),
-                        "title": s.get("title"),
-                        "page": s.get("page"),
-                        "chunk_id": s.get("chunk_id"),
-                        "preview": (s.get("text") or "")[:160],
-                    })
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "intent": intent,
-    })
+    st.session_state.messages.append({"role": "assistant", "content": answer})
